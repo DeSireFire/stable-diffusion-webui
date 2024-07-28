@@ -15,7 +15,8 @@ import torch
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
 import math
-from typing import Optional, NamedTuple, Protocol, List
+from typing import Optional, NamedTuple
+
 
 def narrow_trunc(
     input: Tensor,
@@ -25,12 +26,14 @@ def narrow_trunc(
 ) -> Tensor:
     return torch.narrow(input, dim, start, length if input.shape[dim] >= start + length else input.shape[dim] - start)
 
+
 class AttnChunk(NamedTuple):
     exp_values: Tensor
     exp_weights_sum: Tensor
     max_score: Tensor
 
-class SummarizeChunk(Protocol):
+
+class SummarizeChunk:
     @staticmethod
     def __call__(
         query: Tensor,
@@ -38,13 +41,15 @@ class SummarizeChunk(Protocol):
         value: Tensor,
     ) -> AttnChunk: ...
 
-class ComputeQueryChunkAttn(Protocol):
+
+class ComputeQueryChunkAttn:
     @staticmethod
     def __call__(
         query: Tensor,
         key: Tensor,
         value: Tensor,
     ) -> Tensor: ...
+
 
 def _summarize_chunk(
     query: Tensor,
@@ -53,7 +58,7 @@ def _summarize_chunk(
     scale: float,
 ) -> AttnChunk:
     attn_weights = torch.baddbmm(
-        torch.empty(1, 1, 1, device=query.device, dtype=query.dtype),
+        torch.zeros(1, 1, 1, device=query.device, dtype=query.dtype),
         query,
         key.transpose(1,2),
         alpha=scale,
@@ -62,9 +67,10 @@ def _summarize_chunk(
     max_score, _ = torch.max(attn_weights, -1, keepdim=True)
     max_score = max_score.detach()
     exp_weights = torch.exp(attn_weights - max_score)
-    exp_values = torch.bmm(exp_weights, value)
+    exp_values = torch.bmm(exp_weights, value) if query.device.type == 'mps' else torch.bmm(exp_weights, value.to(exp_weights.dtype)).to(value.dtype)
     max_score = max_score.squeeze(-1)
     return AttnChunk(exp_values, exp_weights.sum(dim=-1), max_score)
+
 
 def _query_chunk_attention(
     query: Tensor,
@@ -91,7 +97,7 @@ def _query_chunk_attention(
         )
         return summarize_chunk(query, key_chunk, value_chunk)
 
-    chunks: List[AttnChunk] = [
+    chunks: list[AttnChunk] = [
         chunk_scanner(chunk) for chunk in torch.arange(0, k_tokens, kv_chunk_size)
     ]
     acc_chunk = AttnChunk(*map(torch.stack, zip(*chunks)))
@@ -106,6 +112,7 @@ def _query_chunk_attention(
     all_weights = torch.unsqueeze(chunk_weights, -1).sum(dim=0)
     return all_values / all_weights
 
+
 # TODO: refactor CrossAttention#get_attention_scores to share code with this
 def _get_attention_scores_no_kv_chunking(
     query: Tensor,
@@ -114,7 +121,7 @@ def _get_attention_scores_no_kv_chunking(
     scale: float,
 ) -> Tensor:
     attn_scores = torch.baddbmm(
-        torch.empty(1, 1, 1, device=query.device, dtype=query.dtype),
+        torch.zeros(1, 1, 1, device=query.device, dtype=query.dtype),
         query,
         key.transpose(1,2),
         alpha=scale,
@@ -122,12 +129,14 @@ def _get_attention_scores_no_kv_chunking(
     )
     attn_probs = attn_scores.softmax(dim=-1)
     del attn_scores
-    hidden_states_slice = torch.bmm(attn_probs, value)
+    hidden_states_slice = torch.bmm(attn_probs, value) if query.device.type == 'mps' else torch.bmm(attn_probs, value.to(attn_probs.dtype)).to(value.dtype)
     return hidden_states_slice
+
 
 class ScannedChunk(NamedTuple):
     chunk_idx: int
     attn_chunk: AttnChunk
+
 
 def efficient_dot_product_attention(
     query: Tensor,
@@ -170,7 +179,7 @@ def efficient_dot_product_attention(
             chunk_idx,
             min(query_chunk_size, q_tokens)
         )
-    
+
     summarize_chunk: SummarizeChunk = partial(_summarize_chunk, scale=scale)
     summarize_chunk: SummarizeChunk = partial(checkpoint, summarize_chunk) if use_checkpoint else summarize_chunk
     compute_query_chunk_attn: ComputeQueryChunkAttn = partial(
@@ -192,14 +201,15 @@ def efficient_dot_product_attention(
             key=key,
             value=value,
         )
-    
-    # TODO: maybe we should use torch.empty_like(query) to allocate storage in-advance,
-    # and pass slices to be mutated, instead of torch.cat()ing the returned slices
-    res = torch.cat([
-        compute_query_chunk_attn(
+
+    res = torch.zeros_like(query)
+    for i in range(math.ceil(q_tokens / query_chunk_size)):
+        attn_scores = compute_query_chunk_attn(
             query=get_query_chunk(i * query_chunk_size),
             key=key,
             value=value,
-        ) for i in range(math.ceil(q_tokens / query_chunk_size))
-    ], dim=1)
+        )
+
+        res[:, i * query_chunk_size:i * query_chunk_size + attn_scores.shape[1], :] = attn_scores
+
     return res
